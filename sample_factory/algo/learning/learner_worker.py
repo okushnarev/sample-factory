@@ -147,7 +147,11 @@ class LearnerWorker(HeartbeatStoppableEventLoopObject, Configurable):
         log.debug(f"{self.object_id} finished initialization!")
 
     def on_new_training_batch(self, batch_idx: int):
-        stats = self.learner.train(self.batcher.training_batches[batch_idx])
+        if self.cfg.use_rnn != True:
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                stats = self.learner.train(self.batcher.training_batches[batch_idx])
+        else:
+            stats = self.learner.train(self.batcher.training_batches[batch_idx])
 
         self.training_iteration_since_resume += 1
         self.training_batch_released.emit(batch_idx, self.training_iteration_since_resume)

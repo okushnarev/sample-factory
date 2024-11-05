@@ -19,7 +19,9 @@ class AgentPolicyMapping:
     """
 
     def __init__(self, cfg: Config, env_info: EnvInfo):
-        self.rng = np.random.RandomState(seed=random.randint(0, 2**32 - 1))
+        #self.rng = np.random.RandomState(seed=random.randint(0, 2**32 - 1))
+        #make it reproducible!!!!!!
+        self.rng = np.random.default_rng(seed=cfg.seed)
 
         self.num_agents = env_info.num_agents
         self.num_policies = cfg.num_policies
@@ -59,4 +61,4 @@ class AgentPolicyMapping:
         return self.env_policies[env_idx][agent_idx]
 
     def _sample_policy(self):
-        return self.rng.randint(0, self.num_policies)
+        return self.rng.integers(0, self.num_policies) #self.rng.randint(0, self.num_policies)

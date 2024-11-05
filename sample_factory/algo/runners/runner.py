@@ -480,7 +480,9 @@ class Runner(EventLoopObject, Configurable):
         if len(self.env_steps) < self.cfg.num_policies:
             return
 
-        metric = self.cfg.save_best_metric
+        metric = self.cfg.save_best_metric # .split(', ')
+        #for metric in metrics:
+        #print(f"runner self.policy_avg_stats = {self.policy_avg_stats}")
         if metric in self.policy_avg_stats:
             for policy_id in range(self.cfg.num_policies):
                 # check if number of samples collected is greater than cfg.save_best_after

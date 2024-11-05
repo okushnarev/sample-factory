@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import random
 from queue import Empty
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -76,6 +75,13 @@ class ActorState:
         self.last_obs = None
         self.last_rnn_state = None
         self.last_value = None
+
+        if getattr(self.cfg, 'core_memory', False):
+            self.agent_last_memory = None
+            self.global_memory = None
+            
+        self.last_history_seq = None
+        self.last_action_seq = None
 
         self.ready = False  # whether this agent received actions from the policy and can act in the environment again
 
@@ -227,7 +233,16 @@ class ActorState:
 
         # Saving obs and hidden states for the step AFTER the last step in the current rollout.
         # We're going to need them later when we calculate next step value estimates.
+        '''
+        if getattr(self.cfg, 'core_memory', False):
+            last_step_data = dict(obs=self.last_obs, rnn_states=self.last_rnn_state,
+                                  agent_memory=self.agent_last_memory,
+                                  global_memory=self.global_memory
+                                 )
+        else:
+        '''
         last_step_data = dict(obs=self.last_obs, rnn_states=self.last_rnn_state)
+        
         self.set_trajectory_data(last_step_data, self.cfg.rollout)
 
         # We could change policy id in the middle of the rollout (i.e. on the episode boundary), in which case
@@ -239,7 +254,7 @@ class ActorState:
         unique_policies = np.unique(self.curr_traj_buffer["policy_id"])
         if len(unique_policies) > 1:
             debug_log_every_n(
-                1000, f"Multiple policies in trajectory buffer: {unique_policies} (-1 means inactive agent)"
+                1000, f"Multiple policies in trajectory buffer for agent {self.agent_idx} with global env # {self.global_env_idx}, self.curr_policy_id = {self.curr_policy_id}: {unique_policies} (-1 means inactive agent), self.curr_traj_buffer[policy_id]: {self.curr_traj_buffer['policy_id']}, last_obs was xy {self.last_obs['xy']}, target_xy {self.last_obs['target_xy']}"
             )
 
         for policy_id in unique_policies:
@@ -355,7 +370,7 @@ class NonBatchedVectorEnvRunner(VectorEnvRunner):
             # TODO: comment
             self.traj_tensors = to_numpy(self.traj_tensors)
             self.policy_output_tensors = to_numpy(self.policy_output_tensors)
-
+        #print(f"non batched sampling __init__/nself.policy_output_tensors: {self.policy_output_tensors.shape}")
         self.num_envs = num_envs
         self.num_agents = env_info.num_agents
 
@@ -442,6 +457,17 @@ class NonBatchedVectorEnvRunner(VectorEnvRunner):
                 actor_state = self.actor_states[env_i][agent_i]
                 actor_state.last_obs = obs
                 actor_state.last_rnn_state = clone_tensor(self.traj_tensors["rnn_states"][0, 0])
+                #print(f"self.traj_tensors = {self.traj_tensors.keys()}")
+                if getattr(self.cfg, 'core_memory', False):
+                    actor_state.agent_last_memory = clone_tensor(self.traj_tensors["agent_memory"][0, 0])
+                    actor_state.global_memory = clone_tensor(self.traj_tensors["global_memory"][0, 0])
+
+                if getattr(self.cfg, 'attn_core', False):
+                    actor_state.last_history_seq = clone_tensor(self.traj_tensors["history_seq"][0, 0])
+                if getattr(self.cfg, 'action_hist', False):
+                    actor_state.last_action_seq = clone_tensor(self.traj_tensors["action_seq"][0, 0])
+                    #print(f"non batched sampling _reset actor_state.last_action_seq = {actor_state.last_action_seq.shape}")
+
                 actor_state.reset_rnn_state()
 
         self.env_step_ready = True
@@ -483,6 +509,9 @@ class NonBatchedVectorEnvRunner(VectorEnvRunner):
                     policy_outputs_dict = dict()
                     for tensor_idx, name in enumerate(actor_state.policy_output_names):
                         policy_outputs_dict[name] = policy_outputs[tensor_idx]
+                    #print(f"\nnon batched sampling policy_outputs_dict for env_i {env_i}, agent_i {agent_i}")
+                    #for k,v in policy_outputs_dict.items():
+                    #    print(f"{k}: {v}")
 
                     # save parsed trajectory outputs directly into the trajectory buffer
                     actor_state.set_trajectory_data(policy_outputs_dict, self.rollout_step)
@@ -491,7 +520,12 @@ class NonBatchedVectorEnvRunner(VectorEnvRunner):
                     # this is an rnn state for the next iteration in the rollout
                     actor_state.last_rnn_state = policy_outputs_dict["new_rnn_states"]
                     actor_state.last_value = policy_outputs_dict["values"].item()
-
+                    #print(f"nonbatched runner self.cfg.core_memory = {getattr(self.cfg, 'core_memory', False)}")
+                    if getattr(self.cfg, 'core_memory', False):
+                        actor_state.agent_last_memory = policy_outputs_dict["agent_new_memory"]
+                    if getattr(self.cfg, 'attn_core', False):
+                        actor_state.last_history_seq = policy_outputs_dict["new_history_seq"]
+                        
                     actor_state.ready = True
                 elif not actor_state.ready:
                     all_actors_ready = False
@@ -599,14 +633,91 @@ class NonBatchedVectorEnvRunner(VectorEnvRunner):
         """
 
         for env_i in range(self.num_envs):
+            # in single sf env bins and worker_idx are the same, so use the first agent 
+            sample_actor_state = self.actor_states[env_i][0]
+            num_agents_per_real_env = sample_actor_state.cfg.environment['agent_bins'][sample_actor_state.worker_idx % len(sample_actor_state.cfg.environment['agent_bins'])] if sample_actor_state.cfg.environment['agent_bins'] is not None else self.num_agents
+            num_real_envs = self.num_agents // num_agents_per_real_env
+
+            
+            # collect individual memories to global sequence
+            last_global_memory_seq = [] #None
+            if getattr(self.cfg, 'core_memory', False):
+                
+                last_global_memory = [[] for i in range(num_real_envs)]#[] 
+                #print(f"nonbatched sampling self.num_agents {self.num_agents}")
+                for agent_i in range(self.num_agents):
+                    actor_state = self.actor_states[env_i][agent_i]
+                    # calculate about num real envs in one sf env and real num agents to propagate global mem correctly
+                    
+                    real_env_idx = agent_i // num_agents_per_real_env
+                    
+                    
+                    #print(f"nonbatched sampling actor_state.worker_idx {actor_state.worker_idx}, actor state cfg = {actor_state.cfg.environment['agent_bins']}")
+                    #print(f"nonbatched sampling: env {env_i} agent {agent_i} type {type(actor_state.last_actions)} actor_state.last_actions = {actor_state.last_actions}, actor_state.agent_last_memory type {type(actor_state.agent_last_memory)} = {actor_state.agent_last_memory}")
+                
+                    # do not exclude incative agents memory cause this will break the length of mem seq but sf requires it ti be constant as defined in shared_buffers
+                    #if actor_state.is_active:
+                        # sample factory reqires all tensors have dims (num_agents, tensor value dim)
+                        # so we operate with flatten memories here and restore the seq len dim in the core model
+                    #print(f"nonbatched actor_state.agent_last_memory = {type(actor_state.agent_last_memory)}, {actor_state.agent_last_memory}, zeros like {np.zeros_like(actor_state.agent_last_memory)}")
+
+                    if ((not actor_state.is_active) and getattr(self.cfg, 'clear_memory', False)):
+                        #print(f'\n\nclear memory for inactive agent {agent_i} in env {env_i}')
+                        last_global_memory[real_env_idx].extend(
+                            np.zeros_like(actor_state.agent_last_memory)
+                        )
+                    else:
+                        last_global_memory[real_env_idx].extend(actor_state.agent_last_memory) #write latest meory that was written to agent state, for inactive agents it would be the mem of their last update
+                if len(last_global_memory[0]) > 0:
+                    padding = np.zeros(len(last_global_memory[0]) * (num_real_envs - 1),
+                                                 dtype=actor_state.agent_last_memory.dtype)
+                for last_gm in last_global_memory:
+                    if len(last_gm) > 0:
+                        # zero padding to fit the allocated tensor shapes
+                        #last_gm.extend(
+                        #            np.zeros(len(last_gm) * (num_real_envs - 1),
+                        #                     dtype=actor_state.agent_last_memory.dtype)
+                        #        )
+                        last_global_memory_seq.append(np.array(last_gm))
+                    else:
+                        last_global_memory_seq.append(None)
+                #print(f"last_global_memory_seq = {last_global_memory_seq}")
+            
+            
             for agent_i in range(self.num_agents):
+                real_env_idx = agent_i // num_agents_per_real_env
+                
                 actor_state = self.actor_states[env_i][agent_i]
 
                 if actor_state.is_active:
                     actor_state.ready = False
-
-                    # populate policy inputs in shared memory
-                    policy_inputs = dict(obs=actor_state.last_obs, rnn_states=actor_state.last_rnn_state)
+                    
+                    if getattr(self.cfg, 'core_memory', False):
+                        actor_state.global_memory = np.concatenate([
+                            last_global_memory_seq[real_env_idx],
+                            padding
+                        ])
+                        # populate policy inputs in shared memory
+                        policy_inputs = dict(
+                            obs=actor_state.last_obs, 
+                            rnn_states=actor_state.last_rnn_state,
+                            agent_memory=actor_state.agent_last_memory,
+                            global_memory=actor_state.global_memory,
+                            )
+                    else:
+                        policy_inputs = dict(obs=actor_state.last_obs, rnn_states=actor_state.last_rnn_state)
+                    if getattr(self.cfg, 'attn_core', False):
+                        #'''
+                        if getattr(self.cfg, 'action_hist', False):
+                            actor_state.last_action_seq = np.append(
+                            actor_state.last_action_seq[1:].copy(),
+                            np.atleast_1d(actor_state.last_actions if actor_state.last_actions is not None else np.array(0))).astype(np.int32)
+                            policy_inputs.update(dict(action_seq=actor_state.last_action_seq))
+                        #'''
+                        policy_inputs.update(dict(history_seq=actor_state.last_history_seq))
+                        
+                    
+                    #print(f"prepare next step for policy {policy_inputs.items()}")
                     actor_state.set_trajectory_data(policy_inputs, self.rollout_step)
                 else:
                     actor_state.ready = True
@@ -629,6 +740,8 @@ class NonBatchedVectorEnvRunner(VectorEnvRunner):
         complete_rollouts, episodic_stats = [], []
 
         for env_i, e in enumerate(self.envs):
+            #print(f"nonbatched sampling env {env_i}: {e}")
+            #print(f"step no {e._elapsed_steps}")
             with timing.add_time("env_step"):
                 actions = [s.curr_actions() for s in self.actor_states[env_i]]
                 new_obs, rewards, terminated, truncated, infos = e.step(actions)

@@ -155,10 +155,25 @@ class ActorCriticSharedWeights(ActorCritic):
         x = self.encoder(normalized_obs_dict)
         return x
 
-    def forward_core(self, head_output: Tensor, rnn_states):
-        x, new_rnn_states = self.core(head_output, rnn_states)
-        return x, new_rnn_states
-
+    def forward_core(self, head_output: Tensor, rnn_states, 
+                     agent_memory=None, 
+                     global_memory=None,
+                     history_seq=None,
+                     action_seq=None,
+                    ):
+        
+        if getattr(self.cfg, 'attn_core', None) == True:
+            x, new_rnn_states, additional_outputs = self.core(head_output, rnn_states,
+                                                              agent_memory=agent_memory, 
+                                                              global_memory=global_memory,
+                                                              history_seq=history_seq,
+                                                              action_seq=action_seq
+                                                             )
+            return x, new_rnn_states, additional_outputs
+        else:
+            x, new_rnn_states = self.core(head_output, rnn_states)
+            return x, new_rnn_states
+        
     def forward_tail(self, core_output, values_only: bool, sample_actions: bool) -> TensorDict:
         decoder_output = self.decoder(core_output)
         values = self.critic_linear(decoder_output).squeeze()
@@ -175,11 +190,42 @@ class ActorCriticSharedWeights(ActorCritic):
         self._maybe_sample_actions(sample_actions, result)
         return result
 
-    def forward(self, normalized_obs_dict, rnn_states, values_only=False) -> TensorDict:
+    def forward(self, normalized_obs_dict, rnn_states, 
+                agent_memory=None, global_memory=None, history_seq=None, action_seq=None,
+                values_only=False) -> TensorDict:
+        #print(f'\nactor critic input\nobs: {normalized_obs_dict}')#\nrnn_states = {rnn_states}\nagent_memory = {agent_memory}\nglobal_memory = {global_memory}')
         x = self.forward_head(normalized_obs_dict)
-        x, new_rnn_states = self.forward_core(x, rnn_states)
+        #print(f"actor_critic enc out {x.shape}, inp rnn states = {rnn_states.shape}")
+        if getattr(self.cfg, 'attn_core', None) == True:
+            x, new_rnn_states, additional_outputs = self.forward_core(x, rnn_states,
+                                                                      agent_memory=agent_memory,
+                                                                      global_memory=global_memory,
+                                                                      history_seq=history_seq,
+                                                                      action_seq=action_seq
+                                                                     )
+        else:
+            x, new_rnn_states = self.forward_core(x, rnn_states)
+            additional_outputs = {}
+        #return x, new_rnn_states, additional_outputs
+
+        agent_new_memory = additional_outputs.get('agent_new_memory', None)
+        global_memory = additional_outputs.get('global_memory', None)
+        new_history_seq = additional_outputs.get('new_history_seq', None)
+        
+        #print(f"core out x {x}")#core new rnn states = {new_rnn_states.shape}
         result = self.forward_tail(x, values_only, sample_actions=True)
+        
         result["new_rnn_states"] = new_rnn_states
+        if getattr(self.cfg, 'core_memory', None) == True:
+            result["agent_new_memory"] = agent_new_memory
+            result["global_memory"] = global_memory
+        if getattr(self.cfg, 'attn_core', None) == True:
+            result["new_history_seq"] = new_history_seq
+        '''
+        print('\nactor critic output')
+        for rk, rv in result.items():
+            print(f"result {rk}: {rv}")
+        '''
         return result
 
 

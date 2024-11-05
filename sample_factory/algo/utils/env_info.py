@@ -38,11 +38,12 @@ class EnvInfo:
     env_info_protocol_version: Optional[int] = None
 
 
+
 def extract_env_info(env: BatchedVecEnv | NonBatchedVecEnv, cfg: Config) -> EnvInfo:
     obs_space = env.observation_space
     action_space = env.action_space
     num_agents = env.num_agents
-
+    
     gpu_actions = cfg.env_gpu_actions
     gpu_observations = cfg.env_gpu_observations
 

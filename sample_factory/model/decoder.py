@@ -21,7 +21,7 @@ class MlpDecoder(Decoder):
         self.mlp = create_mlp(decoder_layers, decoder_input_size, activation)
         if len(decoder_layers) > 0:
             self.mlp = torch.jit.script(self.mlp)
-
+        #print(f"sf decoder: self.mlp = {self.mlp}, decoder_input_size = {decoder_input_size}")
         self.decoder_out_size = calc_num_elements(self.mlp, (decoder_input_size,))
 
     def forward(self, core_output):

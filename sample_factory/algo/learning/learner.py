@@ -9,6 +9,7 @@ from typing import Callable, Dict, Optional, Tuple
 
 import numpy as np
 import torch
+#import random
 from torch import Tensor
 from torch.nn import Module
 
@@ -200,9 +201,25 @@ class Learner(Configurable):
             log.info("Starting seed is not provided")
         else:
             log.info("Setting fixed seed %d", self.cfg.seed)
+            '''
+            os.environ["PYTHONHASHSEED"] = str(self.cfg.seed)
+            log.info(f"Setting PYTHONHASHSEED {os.environ.get('PYTHONHASHSEED', 'empty')}")
+            
+            os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+            log.info(f"Setting torch seed {torch.get_rng_state()}")
+            #log.info(f"torch.seed() seed is {torch.seed()}")
+            # When running on the CuDNN backend, two further options must be set
+            torch.use_deterministic_algorithms(True)
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+            
+            '''
             torch.manual_seed(self.cfg.seed)
-            np.random.seed(self.cfg.seed)
-
+            torch.cuda.manual_seed(self.cfg.seed)
+            # Set a fixed value for the hash seed
+            #np.random.seed(self.cfg.seed)
+            #random.seed(self.cfg.seed)
+        self._rnd = np.random.default_rng(self.cfg.seed)
         # initialize device
         self.device = policy_device(self.cfg, self.policy_id)
 
@@ -378,7 +395,7 @@ class Learner(Configurable):
             log.info(f"Saving new best policy, {metric}={metric_value:.{p}f}!")
             self.best_performance = metric_value
             name_suffix = f"_{metric}_{metric_value:.{p}f}"
-            return self._save_impl("best", name_suffix, 1, verbose=False)
+            return self._save_impl("best", name_suffix, 1, verbose=True)
 
         return False
 
@@ -504,7 +521,7 @@ class Learner(Configurable):
         if self.cfg.shuffle_minibatches:
             # indices that will start the mini-trajectories from the same episode (for bptt)
             indices = np.arange(0, experience_size, self.cfg.recurrence)
-            indices = np.random.permutation(indices)
+            indices = self._rnd.permutation(indices)
 
             # complete indices of mini trajectories, e.g. with recurrence==4: [4, 16] -> [4, 5, 6, 7, 16, 17, 18, 19]
             indices = [np.arange(i, i + self.cfg.recurrence) for i in indices]
@@ -547,7 +564,11 @@ class Learner(Configurable):
 
         # calculate policy head outside of recurrent loop
         with self.timing.add_time("forward_head"):
+            #print(f"learner losses:\n")
+            #print(f"mb.normalized_obs = {[(k, v.shape) for k, v in mb.normalized_obs.items()]}")
             head_outputs = self.actor_critic.forward_head(mb.normalized_obs)
+            #print(f"enc out = {head_outputs.shape}")
+            
             minibatch_size: int = head_outputs.size(0)
 
         # initial rnn states
@@ -562,19 +583,45 @@ class Learner(Configurable):
                     mb.rnn_states,
                     recurrence,
                 )
+                #print(f"use rnn head_output_seq = {head_output_seq.data.shape}\nmb.rnn_states = {mb.rnn_states.shape}\nrnn_states = {rnn_states.shape}. mb.rnn_states[::recurrence] = {mb.rnn_states[::recurrence].shape}")
             else:
                 rnn_states = mb.rnn_states[::recurrence]
+            agent_memories = None
+            global_memories = None
+            history_seqs = None
+            action_seqs = None
+            if getattr(self.cfg, 'core_memory', False):
+                agent_memories = mb.agent_memory
+                global_memories = mb.global_memory
+                #print(f"\nlearner\nagent_memories: {agent_memories}\nglobal_memories: {global_memories}")
+            if getattr(self.cfg, 'attn_core', False):
+                history_seqs = mb.history_seq
+            if getattr(self.cfg, 'action_hist', False):
+                action_seqs = mb.action_seq
 
         # calculate RNN outputs for each timestep in a loop
         with self.timing.add_time("bptt"):
             if self.cfg.use_rnn:
                 with self.timing.add_time("bptt_forward_core"):
                     core_output_seq, _ = self.actor_critic.forward_core(head_output_seq, rnn_states)
+                    #print(f"use rnn core_output_seq = {core_output_seq.data.shape}")
                 core_outputs = build_core_out_from_seq(core_output_seq, inverted_select_inds)
+                
+                
+                #print(f"use rnn core_outputs = {core_outputs.shape}")
                 del core_output_seq
+                
             else:
-                core_outputs, _ = self.actor_critic.forward_core(head_outputs, rnn_states)
-
+                if getattr(self.cfg, 'attn_core', None) == True:
+                    core_outputs, _, _ = self.actor_critic.forward_core(head_outputs, rnn_states,
+                                                                        agent_memory=agent_memories, 
+                                                                        global_memory=global_memories,
+                                                                        history_seq=history_seqs,
+                                                                        action_seq=action_seqs
+                                                                       )
+                else:
+                    core_outputs, _ = self.actor_critic.forward_core(head_outputs, rnn_states)
+                    
             del head_outputs
 
         num_trajectories = minibatch_size // recurrence
@@ -692,9 +739,9 @@ class Learner(Configurable):
             # KL-divergence and ratio of PPO-clipped samples, which makes this data even more useful for analysis.
             # Something to consider: maybe we should have these last-batch metrics in a separate summaries category?
             with_summaries = self._should_save_summaries()
-            if np.random.rand() < 0.5:
-                summaries_epoch = np.random.randint(0, self.cfg.num_epochs)
-                summaries_batch = np.random.randint(0, self.cfg.num_batches_per_epoch)
+            if self._rnd.random() < 0.5:
+                summaries_epoch = self._rnd.integers(0, self.cfg.num_epochs)
+                summaries_batch = self._rnd.integers(0, self.cfg.num_batches_per_epoch)
             else:
                 summaries_epoch = self.cfg.num_epochs - 1
                 summaries_batch = self.cfg.num_batches_per_epoch - 1
@@ -715,7 +762,7 @@ class Learner(Configurable):
 
                     # current minibatch consisting of short trajectory segments with length == recurrence
                     mb = self._get_minibatch(gpu_buffer, indices)
-
+                    #print(f"train mb {mb}")
                     # enable syntactic sugar that allows us to access dict's keys as object attributes
                     mb = AttrDict(mb)
 
@@ -938,7 +985,9 @@ class Learner(Configurable):
         with torch.no_grad():
             # create a shallow copy so we can modify the dictionary
             # we still reference the same buffers though
+            #print(f"prepare batch {batch}")
             buff = shallow_recursive_copy(batch)
+            #print(f"buff = {buff}")
 
             # ignore experience from other agents (i.e. on episode boundary) and from inactive agents
             valids: Tensor = buff["policy_id"] == self.policy_id
@@ -957,7 +1006,24 @@ class Learner(Configurable):
 
             # calculate estimated value for the next step (T+1)
             normalized_last_obs = buff["normalized_obs"][:, -1]
-            next_values = self.actor_critic(normalized_last_obs, buff["rnn_states"][:, -1], values_only=True)["values"]
+            
+            agent_memory = None
+            global_memory = None
+            history_seq = None
+            action_seq = None
+            if getattr(self.cfg, 'core_memory', False):
+                #print(f"prepare learner batch buff[agent_memory] = {buff['agent_memory'].shape}\nbuff[global_memory] = {buff['global_memory'].shape}\nbuff[rnn_states] = {buff['rnn_states'].shape}")
+                agent_memory = buff["agent_memory"][:, -1]
+                global_memory = buff["global_memory"][:, -1]
+            if getattr(self.cfg, 'attn_core', False):
+                history_seq = buff["history_seq"][:, -1]
+            if getattr(self.cfg, 'action_hist', False):
+                action_seq = buff["action_seq"][:, -1]
+
+            next_values = self.actor_critic(normalized_last_obs, buff["rnn_states"][:, -1], agent_memory=agent_memory, global_memory=global_memory, history_seq=history_seq, action_seq=action_seq,
+                                            values_only=True)["values"]
+            
+
             buff["values"][:, -1] = next_values
 
             if self.cfg.normalize_returns:
@@ -1002,6 +1068,7 @@ class Learner(Configurable):
 
             dataset_size = buff["actions"].shape[0] * buff["actions"].shape[1]
             for d, k, v in iterate_recursively(buff):
+                #print(f"learner v {v.shape}, dataset_size = {dataset_size}")
                 # collapse first two dimensions (batch and time) into a single dimension
                 d[k] = v.reshape((dataset_size,) + tuple(v.shape[2:]))
 

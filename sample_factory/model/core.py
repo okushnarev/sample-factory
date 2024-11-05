@@ -35,6 +35,7 @@ class ModelCoreRNN(ModelCore):
         self.rnn_num_layers = cfg.rnn_num_layers
 
     def forward(self, head_output, rnn_states):
+        #print(f"rnn core head_output {head_output.shape}, rnn_states = {rnn_states.shape}")
         is_seq = not torch.is_tensor(head_output)
         if not is_seq:
             head_output = head_output.unsqueeze(0)

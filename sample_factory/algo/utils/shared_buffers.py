@@ -7,6 +7,7 @@ import torch
 from gymnasium import spaces
 from signal_slot.queue_utils import get_queue
 from torch import Tensor
+import torch
 
 from sample_factory.algo.sampling.sampling_utils import rollout_worker_device
 from sample_factory.algo.utils.action_distributions import calc_num_action_parameters, calc_num_actions
@@ -32,23 +33,32 @@ def policy_device(cfg: AttrDict, policy_id: PolicyID) -> torch.device:
         return torch.device("cuda", index=gpus_for_process(policy_id, 1)[0])
 
 
-def init_tensor(leading_dimensions: List, tensor_type, tensor_shape, device: torch.device, share: bool) -> Tensor:
+def init_tensor(leading_dimensions: List, tensor_type, tensor_shape, device: torch.device, share: bool, rand=False, param=False) -> Tensor:
     if not isinstance(tensor_type, torch.dtype):
         tensor_type = to_torch_dtype(tensor_type)
 
-    # filter out dimensions with size 0
     tensor_shape = [x for x in tensor_shape if x]
-
+    #print('filter out dimensions with size 0')
+    
     final_shape = leading_dimensions + list(tensor_shape)
-    t = torch.zeros(final_shape, dtype=tensor_type)
-
+    
     # fill with magic values to make it easy to spot if we ever use unintialized data
-    if t.is_floating_point():
-        t.fill_(MAGIC_FLOAT)
-    elif tensor_type in (torch.int, torch.int32, torch.int64, torch.int8, torch.uint8):
-        t.fill_(MAGIC_INT)
-
+    #print(f"final shape {final_shape}")
+    if rand:
+        t = torch.zeros(final_shape, dtype=tensor_type)#rand
+    else:
+        t = torch.zeros(final_shape, dtype=tensor_type)
+        #print('zeros')    
+        if t.is_floating_point():
+            t.fill_(MAGIC_FLOAT)
+        elif tensor_type in (torch.int, torch.int32, torch.int64, torch.int8, torch.uint8):
+            t.fill_(MAGIC_INT)
+        #print('fill')
+    #print('to device')
     t = t.to(device)
+    #print(f"param {param}")
+    if param:
+        t = torch.nn.Parameter(t)
 
     # CUDA tensors are already shared by default
     if share and not t.is_cuda:
@@ -76,9 +86,11 @@ def policy_output_shapes(num_actions, num_action_distribution_parameters) -> Lis
     return policy_outputs
 
 
-def alloc_trajectory_tensors(env_info: EnvInfo, num_traj, rollout, rnn_size, device, share) -> TensorDict:
+def alloc_trajectory_tensors(env_info: EnvInfo, num_traj, rollout, rnn_size, device, share,
+                             core_hidden_size=None, attn_core=False, core_mem=False, action_hist=False) -> TensorDict:
     obs_space = env_info.obs_space
-
+    num_agents = env_info.num_agents
+    
     tensors = TensorDict()
 
     # policy inputs
@@ -90,6 +102,23 @@ def alloc_trajectory_tensors(env_info: EnvInfo, num_traj, rollout, rnn_size, dev
     for space_name, space in obs_space.spaces.items():
         tensors["obs"][space_name] = init_tensor([num_traj, rollout + 1], space.dtype, space.shape, device, share)
     tensors["rnn_states"] = init_tensor([num_traj, rollout + 1], torch.float32, [rnn_size], device, share)
+    if core_mem:
+        tensors["agent_memory"] = init_tensor([num_traj, rollout], torch.float32, [1*core_hidden_size], device, share, rand=True, 
+                                              #param=True
+                                             )
+        #print(f'agent mem {num_agents}')
+        tensors["global_memory"] = init_tensor([num_traj, rollout], torch.float32, [num_agents*core_hidden_size], device, share, rand=True, 
+                                               #param=True
+                                              )
+        #print('glo mem')
+
+    if attn_core:
+        tensors["history_seq"] = init_tensor([num_traj, rollout], torch.float32, [rollout*core_hidden_size], device, share, rand=False)
+        tensors["history_seq"] = tensors["history_seq"].zero_()
+    if action_hist:
+        tensors["action_seq"] = init_tensor([num_traj, rollout], torch.int32, [rollout*1], device, share, rand=False)
+        tensors["action_seq"] = tensors["action_seq"].zero_()
+    
 
     num_actions, num_action_distribution_parameters = action_info(env_info)
     policy_outputs = policy_output_shapes(num_actions, num_action_distribution_parameters)
@@ -120,7 +149,8 @@ def alloc_trajectory_tensors(env_info: EnvInfo, num_traj, rollout, rnn_size, dev
 def alloc_policy_output_tensors(cfg, env_info: EnvInfo, rnn_size, device, share):
     num_agents = env_info.num_agents
     envs_per_split = cfg.num_envs_per_worker // cfg.worker_num_splits
-
+    core_hidden_size = cfg.core['core_hidden_size'] if getattr(cfg, 'attn_core', False) else None
+    #print(f"shared buffers core_hidden_size {type(core_hidden_size)}, {core_hidden_size}")
     policy_outputs_shape = [cfg.num_workers, cfg.worker_num_splits]
     if cfg.batched_sampling:
         policy_outputs_shape += [envs_per_split * num_agents]
@@ -130,6 +160,13 @@ def alloc_policy_output_tensors(cfg, env_info: EnvInfo, rnn_size, device, share)
     num_actions, num_action_distribution_parameters = action_info(env_info)
     policy_outputs = policy_output_shapes(num_actions, num_action_distribution_parameters)
     policy_outputs += [("new_rnn_states", [rnn_size])]  # different name so we don't override current step rnn_state
+    if cfg.core_memory:
+        #("abra", [3]),# set here the length of seq for your variable if != 1
+        policy_outputs += [("agent_new_memory", [1 * core_hidden_size])] # to distinguish old and new agent memory
+        policy_outputs += [("global_memory", [num_agents * core_hidden_size])] # havent changed so can be owerwritten
+    if cfg.attn_core:
+        policy_outputs += [("new_history_seq", [cfg.rollout * core_hidden_size])] # updates to last rollout observations
+
 
     output_names, output_shapes = list(zip(*policy_outputs))
     output_sizes = [shape[0] if shape else 1 for shape in output_shapes]
@@ -205,6 +242,7 @@ class BufferMgr(Configurable):
 
         for device, num_buffers in self.buffers_per_device.items():
             # make sure that at the very least we have enough buffers to feed the learner
+            log.info('241')
             num_buffers = max(
                 num_buffers,
                 self.max_batches_to_accumulate * self.trajectories_per_training_iteration * cfg.num_policies,
@@ -219,6 +257,10 @@ class BufferMgr(Configurable):
                 rnn_size,
                 device,
                 share,
+                cfg.core['core_hidden_size'] if getattr(cfg, 'attn_core', False) else None,
+                cfg.attn_core,
+                cfg.core_memory,
+                cfg.action_hist,
             )
             self.policy_output_tensors_torch[device], output_names, output_sizes = alloc_policy_output_tensors(
                 cfg, env_info, rnn_size, device, share

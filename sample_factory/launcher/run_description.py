@@ -23,6 +23,7 @@ class ParamList(ParamGenerator):
     def __init__(self, combinations):
         super(ParamList, self).__init__()
         self.combinations = combinations
+        
 
     def generate_params(self, randomize=True):
         if randomize:

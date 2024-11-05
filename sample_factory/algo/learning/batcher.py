@@ -1,4 +1,4 @@
-import random
+import numpy as np
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
@@ -120,6 +120,7 @@ class Batcher(HeartbeatStoppableEventLoopObject):
         self.traj_tensors_to_release: List[List[Tuple[Device, slice]]] = [
             [] for _ in range(self.max_batches_to_accumulate)
         ]
+        self._rnd = np.random.default_rng(self.cfg.seed)
 
     @signal
     def initialized(self):
@@ -156,7 +157,18 @@ class Batcher(HeartbeatStoppableEventLoopObject):
                 rnn_size,
                 device,
                 False,
+                self.cfg.core['core_hidden_size'] if getattr(self.cfg, 'attn_core', False) else None,
+                getattr(self.cfg, 'attn_core', False),
+                getattr(self.cfg, 'core_memory', False),
+                getattr(self.cfg, 'action_hist', False)
             )
+            
+            #if i == 0:
+                #print('batcher')
+                #for space_name, space in self.env_info.obs_space.spaces.items():
+                #    print(f"{space_name}: {training_batch['obs'][space_name].shape}")
+                #print(f"rnn states {training_batch['rnn_states']}") #.shape tensor filled with MAGIC_FLOAT const
+            
             self.training_batches.append(training_batch)
 
         self.initialized.emit()
@@ -191,7 +203,7 @@ class Batcher(HeartbeatStoppableEventLoopObject):
 
                 # extract slices of trajectories and copy them to the training batch
                 devices = list(self.slices_for_training.keys())
-                random.shuffle(devices)  # so that no sampling device is preferred
+                self._rnd.shuffle(devices)  # so that no sampling device is preferred
 
                 trajectories_copied = 0
                 remaining = self.traj_per_training_iteration - trajectories_copied
